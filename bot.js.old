@@ -1,0 +1,426 @@
+require('dotenv').config();
+const { Telegraf, Markup } = require('telegraf');
+const express = require('express');
+const crypto = require('crypto');
+const axios = require('axios');
+const { parse } = require('node-html-parser');
+const { Pool } = require('pg');
+const fs = require('fs');
+
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SECRET = process.env.YOOKASSA_SECRET;
+const ADMIN_ID = parseInt(process.env.ADMIN_ID || '799677717');
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+
+const PRICES = {
+  pack_50: { sites: 50, price: 300, label: '50 сайтов - 300 руб' },
+  pack_200: { sites: 200, price: 900, label: '200 сайтов - 900 руб' },
+  pack_500: { sites: 500, price: 1900, label: '500 сайтов - 1900 руб' },
+  unlimited: { sites: 999999, price: 4900, label: 'Безлимит 30 дней - 4900 руб' }
+};
+
+const pool = new Pool();
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lead_users (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT UNIQUE NOT NULL,
+      username VARCHAR(255),
+      balance INT DEFAULT 0,
+      unlimited_until TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS lead_payments (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL,
+      payment_id VARCHAR(255),
+      amount INT NOT NULL,
+      sites_added INT,
+      status VARCHAR(50) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS lead_usage (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL,
+      sites_count INT NOT NULL,
+      emails_found INT DEFAULT 0,
+      search_query VARCHAR(500),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('DB ready');
+}
+
+async function getUser(tgId) {
+  const res = await pool.query('SELECT * FROM lead_users WHERE telegram_id = $1', [tgId]);
+  return res.rows[0];
+}
+
+async function createUser(tgId, username) {
+  await pool.query(
+    'INSERT INTO lead_users (telegram_id, username, balance) VALUES ($1, $2, 5) ON CONFLICT (telegram_id) DO NOTHING',
+    [tgId, username]
+  );
+  return getUser(tgId);
+}
+
+async function updateBalance(tgId, delta) {
+  await pool.query('UPDATE lead_users SET balance = balance + $1 WHERE telegram_id = $2', [delta, tgId]);
+}
+
+// Search function using DuckDuckGo
+// Search function using DuckDuckGo HTML parsing (more reliable)
+async function searchWebsites(query, maxResults = 20) {
+  try {
+    const response = await axios.get('https://html.duckduckgo.com/html/', {
+      params: { q: query },
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8'
+      },
+      timeout: 15000
+    });
+
+    // Extract URLs from uddg parameter (DuckDuckGo's redirect URLs)
+    const uddgMatches = response.data.match(/uddg=([^&"]+)/g) || [];
+    const urls = [];
+    const seenDomains = new Set();
+    
+    const skipDomains = ['youtube.com', 'facebook.com', 'vk.com', 'instagram.com', 'twitter.com',
+      'wikipedia.org', 'avito.ru', 'yandex.ru', 'google.com', 'dzen.ru', 'duckduckgo.com',
+      'ok.ru', 'tiktok.com', 'pinterest.com', 'rutube.ru', 'kp.ru', 'rbc.ru'];
+
+    for (const match of uddgMatches) {
+      if (urls.length >= maxResults) break;
+      try {
+        const url = decodeURIComponent(match.replace('uddg=', ''));
+        if (!url.startsWith('http')) continue;
+        
+        const domain = new URL(url).hostname.replace('www.', '');
+        if (seenDomains.has(domain)) continue;
+        if (skipDomains.some(d => domain.includes(d))) continue;
+        
+        seenDomains.add(domain);
+        urls.push(url);
+      } catch {}
+    }
+    
+    console.log('DuckDuckGo found:', urls.length, 'URLs for:', query);
+    return urls;
+  } catch (e) {
+    console.error('Search error:', e.message);
+    return [];
+  }
+}
+
+
+const EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const PHONE_RE = /(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/g;
+const TG_RE = /(?:t\.me\/|@)([a-zA-Z0-9_]{5,32})/g;
+const EXCLUDE = ['example.com', 'wixpress.com', 'googleapis.com', 'google.com', 'facebook.com', 'sentry.io', 'schema.org'];
+
+async function scrapeSite(url) {
+  if (!url.startsWith('http')) url = 'https://' + url;
+  const result = { url, domain: '', emails: [], phones: [], telegram: [], status: 'ok' };
+
+  try { result.domain = (new URL(url)).hostname.replace('www.', ''); } catch { result.domain = url; }
+
+  try {
+    const resp = await axios.get(url, {
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
+      maxRedirects: 3
+    });
+    const html = resp.data || '';
+    const root = parse(html);
+    const text = root.textContent + ' ' + html;
+
+    const emailSet = new Set();
+    const phoneSet = new Set();
+    const tgSet = new Set();
+
+    (text.match(EMAIL_RE) || []).forEach(e => {
+      e = e.toLowerCase();
+      if (!EXCLUDE.some(ex => e.includes(ex))) emailSet.add(e);
+    });
+
+    (text.match(PHONE_RE) || []).forEach(p => {
+      const clean = p.replace(/[\s\-\(\)]/g, '');
+      phoneSet.add(clean.startsWith('8') ? '+7' + clean.slice(1) : clean);
+    });
+
+    (text.match(TG_RE) || []).forEach(t => {
+      const uname = t.replace('t.me/', '').replace('@', '');
+      if (!['share', 'joinchat', 'intent'].includes(uname.toLowerCase())) tgSet.add('@' + uname);
+    });
+
+    result.emails = [...emailSet];
+    result.phones = [...phoneSet];
+    result.telegram = [...tgSet];
+  } catch (e) {
+    result.status = 'error';
+  }
+
+  return result;
+}
+
+async function scrapeMultiple(urls, onProgress) {
+  const results = [];
+  for (let i = 0; i < urls.length; i++) {
+    const r = await scrapeSite(urls[i]);
+    results.push(r);
+    if (onProgress && (i + 1) % 5 === 0) await onProgress(i + 1, urls.length, r);
+  }
+  return results;
+}
+
+function toCSV(results) {
+  const header = 'Domain;Email;Phone;Telegram;URL;Status\n';
+  const rows = results.map(r =>
+    [r.domain, r.emails.join(', '), r.phones.join(', '), r.telegram.join(', '), r.url, r.status].join(';')
+  ).join('\n');
+  return header + rows;
+}
+
+const bot = new Telegraf(BOT_TOKEN);
+
+bot.start(async (ctx) => {
+  const user = await createUser(ctx.from.id, ctx.from.username);
+  await ctx.reply(
+    '🔍 *Lead Scraper* - сборщик контактов\n\n' +
+    '📦 Баланс: ' + user.balance + ' сайтов\n\n' +
+    '*Два режима работы:*\n' +
+    '1️⃣ *Поиск* - напишите запрос, например:\n' +
+    '`натяжные потолки москва`\n\n' +
+    '2️⃣ *Список URL* - отправьте сайты:\n' +
+    '`site1.ru`\n`site2.ru`\n\n' +
+    '💡 5 сайтов бесплатно!\n\n🌐 lanaaihelper.ru',
+    { parse_mode: 'Markdown', ...Markup.keyboard([['🔍 Поиск', '📋 URL'], ['💰 Купить', '📊 Баланс'], ['❓ Помощь']]).resize() }
+  );
+});
+
+// Track user mode
+const userMode = new Map();
+
+bot.hears('🔍 Поиск', async (ctx) => {
+  userMode.set(ctx.from.id, 'search');
+  await ctx.reply('🔍 *Режим поиска*\n\nНапишите поисковый запрос, например:\n`натяжные потолки спб`\n`ремонт квартир казань`',
+    { parse_mode: 'Markdown' });
+});
+
+bot.hears('📋 URL', async (ctx) => {
+  userMode.set(ctx.from.id, 'url');
+  await ctx.reply('📋 *Режим URL*\n\nОтправьте список сайтов, каждый с новой строки:\n`site1.ru`\n`site2.ru`',
+    { parse_mode: 'Markdown' });
+});
+
+bot.hears('📊 Баланс', async (ctx) => {
+  const user = await getUser(ctx.from.id);
+  if (!user) return ctx.reply('/start');
+  const unl = user.unlimited_until && new Date(user.unlimited_until) > new Date();
+  await ctx.reply(unl ? '♾ Безлимит активен' : '📦 Баланс: *' + user.balance + '* сайтов', { parse_mode: 'Markdown' });
+});
+
+bot.hears('💰 Купить', async (ctx) => {
+  await ctx.reply('💰 *Выберите пакет:*', {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback(PRICES.pack_50.label, 'buy_pack_50')],
+      [Markup.button.callback(PRICES.pack_200.label, 'buy_pack_200')],
+      [Markup.button.callback(PRICES.pack_500.label, 'buy_pack_500')],
+      [Markup.button.callback(PRICES.unlimited.label, 'buy_unlimited')]
+    ])
+  });
+});
+
+bot.hears('❓ Помощь', (ctx) => ctx.reply(
+  '*Как пользоваться:*\n\n' +
+  '🔍 *Поиск* - введите запрос типа "натяжные потолки москва" и бот найдёт сайты и соберёт контакты\n\n' +
+  '📋 *URL* - отправьте готовый список сайтов\n\n' +
+  '📊 *Баланс* - проверить остаток\n\n' +
+  '💰 *Купить* - пополнить баланс\n\n' +
+  '🌐 lanaaihelper.ru',
+  { parse_mode: 'Markdown' }
+));
+
+bot.action(/^buy_(.+)$/, async (ctx) => {
+  const packId = ctx.match[1];
+  const pack = PRICES[packId];
+  if (!pack) return ctx.answerCbQuery('Пакет не найден');
+  await ctx.answerCbQuery();
+
+  try {
+    const resp = await axios.post('https://api.yookassa.ru/v3/payments', {
+      amount: { value: pack.price.toFixed(2), currency: 'RUB' },
+      capture: true,
+      confirmation: { type: 'redirect', return_url: 'https://t.me/LanaAIParser_bot' },
+      description: 'Lead Scraper: ' + pack.label,
+      metadata: { telegram_id: String(ctx.from.id), pack_id: packId }
+    }, {
+      auth: { username: YOOKASSA_SHOP_ID, password: YOOKASSA_SECRET },
+      headers: { 'Idempotence-Key': crypto.randomUUID() }
+    });
+
+    await pool.query(
+      'INSERT INTO lead_payments (telegram_id, payment_id, amount, sites_added, status) VALUES ($1, $2, $3, $4, $5)',
+      [ctx.from.id, resp.data.id, pack.price, pack.sites, 'pending']
+    );
+
+    await ctx.reply('💳 *' + pack.label + '*', {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.url('💳 Оплатить', resp.data.confirmation.confirmation_url)]])
+    });
+  } catch (e) {
+    console.error('Payment error:', e.response ? e.response.data : e.message);
+    await ctx.reply('❌ Ошибка оплаты');
+  }
+});
+
+// Process search or URL scraping
+async function processRequest(ctx, urls, searchQuery = null) {
+  const user = await getUser(ctx.from.id);
+  if (!user) return ctx.reply('/start');
+
+  const isUnl = user.unlimited_until && new Date(user.unlimited_until) > new Date();
+  const isAdm = ctx.from.id === ADMIN_ID;
+
+  if (!isUnl && !isAdm && user.balance < urls.length) {
+    return ctx.reply('❌ Нужно: ' + urls.length + ', баланс: ' + user.balance,
+      Markup.inlineKeyboard([[Markup.button.callback('💰 Купить', 'buy_pack_50')]]));
+  }
+
+  const msg = await ctx.reply('⏳ Обработка ' + urls.length + ' сайтов...');
+
+  try {
+    const results = await scrapeMultiple(urls, async (cur, total) => {
+      if (cur % 5 === 0) {
+        await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, '⏳ ' + cur + '/' + total + '...').catch(() => {});
+      }
+    });
+
+    if (!isUnl && !isAdm) await updateBalance(ctx.from.id, -urls.length);
+
+    const emailsFound = results.filter(r => r.emails.length > 0).length;
+    await pool.query('INSERT INTO lead_usage (telegram_id, sites_count, emails_found, search_query) VALUES ($1, $2, $3, $4)',
+      [ctx.from.id, urls.length, emailsFound, searchQuery]);
+
+    const csv = toCSV(results);
+    const fpath = '/tmp/contacts_' + Date.now() + '.csv';
+    fs.writeFileSync(fpath, csv, 'utf8');
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
+    const newUser = await getUser(ctx.from.id);
+
+    await ctx.replyWithDocument({ source: fpath, filename: 'contacts.csv' }, {
+      caption: '✅ Готово!' + (searchQuery ? '\n🔍 Запрос: ' + searchQuery : '') +
+        '\n📊 Сайтов: ' + results.length + '\n📧 С email: ' + emailsFound +
+        '\n📦 Остаток: ' + (isAdm ? '∞' : newUser.balance)
+    });
+
+    fs.unlinkSync(fpath);
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ Ошибка обработки');
+  }
+}
+
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (text.startsWith('/') || ['💰', '📊', '❓', '🔍 Поиск', '📋 URL'].includes(text)) return;
+
+  const user = await getUser(ctx.from.id);
+  if (!user) return ctx.reply('/start');
+
+  // Determine mode: if text contains dots/URLs -> URL mode, otherwise -> search mode
+  const hasUrls = text.split('\n').some(l => l.includes('.') && !l.includes(' '));
+  const mode = userMode.get(ctx.from.id) || (hasUrls ? 'url' : 'search');
+
+  if (mode === 'search' || (!hasUrls && text.length > 3)) {
+    // Search mode
+    const msg = await ctx.reply('🔍 Ищу сайты по запросу: *' + text + '*...', { parse_mode: 'Markdown' });
+
+    const urls = await searchWebsites(text, 20);
+
+    if (urls.length === 0) {
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+        '❌ Ничего не найдено. Попробуйте другой запрос.');
+      return;
+    }
+
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null,
+      '✅ Найдено ' + urls.length + ' сайтов. Собираю контакты...');
+
+    await processRequest(ctx, urls, text);
+  } else {
+    // URL mode
+    const urls = text.split('\n').map(l => l.trim()).filter(l => l && l.includes('.'));
+    if (!urls.length) {
+      return ctx.reply('Отправьте список URL или поисковый запрос');
+    }
+    await processRequest(ctx, urls);
+  }
+});
+
+bot.command('stats', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const users = await pool.query('SELECT COUNT(*) FROM lead_users');
+  const usage = await pool.query('SELECT SUM(sites_count) as sites, SUM(emails_found) as emails FROM lead_usage');
+  const pay = await pool.query("SELECT SUM(amount) as total FROM lead_payments WHERE status = 'succeeded'");
+  const searches = await pool.query("SELECT COUNT(*) FROM lead_usage WHERE search_query IS NOT NULL");
+  await ctx.reply('👥 Юзеров: ' + users.rows[0].count +
+    '\n🔍 Поисков: ' + searches.rows[0].count +
+    '\n📊 Сайтов: ' + (usage.rows[0].sites || 0) +
+    '\n📧 Email: ' + (usage.rows[0].emails || 0) +
+    '\n💰 Доход: ' + (pay.rows[0].total || 0) + ' руб');
+});
+
+const app = express();
+app.use(express.json());
+
+app.post('/leadscraper-webhook', async (req, res) => {
+  const { event, object } = req.body;
+  if (event === 'payment.succeeded') {
+    const { id, metadata } = object;
+    const tgId = parseInt(metadata.telegram_id);
+    const packId = metadata.pack_id;
+    const pack = PRICES[packId];
+
+    await pool.query('UPDATE lead_payments SET status = $1 WHERE payment_id = $2', ['succeeded', id]);
+
+    if (packId === 'unlimited') {
+      const until = new Date();
+      until.setDate(until.getDate() + 30);
+      await pool.query('UPDATE lead_users SET unlimited_until = $1 WHERE telegram_id = $2', [until, tgId]);
+    } else {
+      await updateBalance(tgId, pack.sites);
+    }
+
+    await bot.telegram.sendMessage(tgId, '✅ Оплата получена! ' + (packId === 'unlimited' ? '♾ Безлимит 30 дней' : '📦 +' + pack.sites + ' сайтов'));
+    await bot.telegram.sendMessage(ADMIN_ID, '💰 +' + pack.price + ' руб от ' + tgId);
+  }
+  res.json({ status: 'ok' });
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+const PORT = process.env.PORT || 3002;
+
+async function start() {
+  await initDB();
+  if (process.env.NODE_ENV === 'production') {
+    app.use(bot.webhookCallback('/leadscraper-bot'));
+    await bot.telegram.setWebhook(WEBHOOK_URL + '/leadscraper-bot');
+    console.log('Webhook set');
+  } else {
+    bot.launch();
+    console.log('Polling mode');
+  }
+  app.listen(PORT, () => console.log('Port ' + PORT));
+}
+
+start().catch(console.error);
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));

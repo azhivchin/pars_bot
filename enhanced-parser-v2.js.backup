@@ -1,0 +1,198 @@
+const ExcelJS = require('exceljs');
+const { parse } = require('node-html-parser');
+const axios = require('axios');
+
+function extractCompanyName(html, url) {
+  const root = parse(html);
+  
+  const ogSiteName = root.querySelector('meta[property="og:site_name"]');
+  if (ogSiteName) {
+    const name = ogSiteName.getAttribute('content');
+    if (name && name.length > 2) return cleanText(name);
+  }
+  
+  const title = root.querySelector('title');
+  if (title) {
+    let name = title.text.split(/[-|]/)[0].trim();
+    if (name.length > 2) return cleanText(name);
+  }
+  
+  const h1 = root.querySelector('h1');
+  if (h1) {
+    const name = h1.text.trim();
+    if (name.length > 2 && name.length < 100) {
+      return cleanText(name);
+    }
+  }
+  
+  try {
+    return new URL(url).hostname.replace('www.', '').split('.')[0];
+  } catch {
+    return 'Unknown';
+  }
+}
+
+function extractAddress(html) {
+  const text = parse(html).text;
+  
+  const patterns = [
+    /(?:г\.?\s*)([А-ЯЁа-яё][А-ЯЁа-яё\s-]+),\s*(?:ул\.?\s*)([А-ЯЁа-яё][А-ЯЁа-яё\s-]+),\s*(?:д\.?\s*)(\d+)/gi,
+    /(Москва|Санкт-Петербург|СПб),\s*([А-ЯЁа-яё][А-ЯЁа-яё\s-]+),\s*(\d+)/gi
+  ];
+  
+  for (const pattern of patterns) {
+    const matches = text.match(pattern);
+    if (matches && matches.length > 0) {
+      const addr = matches[0].replace(/\s+/g, ' ').trim();
+      if (addr.length > 10 && addr.length < 200) {
+        return cleanText(addr);
+      }
+    }
+  }
+  
+  return null;
+}
+
+function extractPhones(html) {
+  const text = html.replace(/<[^>]*>/g, ' ');
+  const patterns = [
+    /\+7\s*\(?\d{3}\)?\s*\d{3}[-\s]?\d{2}[-\s]?\d{2}/g,
+    /8\s*\(?\d{3}\)?\s*\d{3}[-\s]?\d{2}[-\s]?\d{2}/g,
+    /8\d{10}/g,
+    /\+7\d{10}/g
+  ];
+  
+  const phones = new Set();
+  for (const pattern of patterns) {
+    const matches = text.match(pattern) || [];
+    matches.forEach(phone => {
+      let cleaned = phone.replace(/[^\d+]/g, '');
+      if (cleaned.startsWith('8')) cleaned = '+7' + cleaned.substring(1);
+      if (cleaned.length >= 11) phones.add(cleaned);
+    });
+  }
+  
+  return Array.from(phones);
+}
+
+function extractEmails(html) {
+  const text = html.replace(/<[^>]*>/g, ' ');
+  const pattern = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const emails = new Set();
+  
+  const matches = text.match(pattern) || [];
+  matches.forEach(email => {
+    email = email.toLowerCase();
+    if (!email.includes('@example.') && !email.includes('@domain.')) {
+      emails.add(email);
+    }
+  });
+  
+  return Array.from(emails);
+}
+
+function extractTelegram(html) {
+  const patterns = [
+    /@([a-zA-Z0-9_]{5,32})/g,
+    /t\.me\/([a-zA-Z0-9_]{5,32})/g
+  ];
+  
+  const telegrams = new Set();
+  for (const pattern of patterns) {
+    const matches = html.match(pattern) || [];
+    matches.forEach(match => {
+      const username = match.replace(/.*\//, '').replace('@', '');
+      if (username.length >= 5 && !['share', 'joinchat', 'intent'].includes(username.toLowerCase())) {
+        telegrams.add('@' + username);
+      }
+    });
+  }
+  
+  return Array.from(telegrams).slice(0, 3);
+}
+
+function cleanText(text) {
+  return text.replace(/\s+/g, ' ').trim().substring(0, 200);
+}
+
+async function createExcelFile(results, filename) {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Contacts');
+  
+  worksheet.columns = [
+    { header: 'No', key: 'num', width: 5 },
+    { header: 'Company', key: 'company', width: 30 },
+    { header: 'Website', key: 'url', width: 40 },
+    { header: 'Phones', key: 'phones', width: 25 },
+    { header: 'Emails', key: 'emails', width: 30 },
+    { header: 'Telegram', key: 'telegram', width: 20 },
+    { header: 'Address', key: 'address', width: 50 }
+  ];
+  
+  worksheet.getRow(1).font = { bold: true };
+  worksheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF4472C4' }
+  };
+  
+  results.forEach((result, index) => {
+    worksheet.addRow({
+      num: index + 1,
+      company: result.company || 'Not specified',
+      url: result.url,
+      phones: result.phones.join(', ') || 'Not found',
+      emails: result.emails.join(', ') || 'Not found',
+      telegram: result.telegram.join(', ') || 'Not found',
+      address: result.address || 'Not found'
+    });
+  });
+  
+    const filepath = filename.startsWith("/tmp/") ? filename : "/tmp/" + filename;
+  await workbook.xlsx.writeFile(filepath);
+  return filepath;
+}
+
+async function scrapeWebsiteFull(url) {
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      timeout: 15000,
+      maxRedirects: 3
+    });
+    
+    const html = response.data;
+    
+    return {
+      url,
+      company: extractCompanyName(html, url),
+      address: extractAddress(html),
+      phones: extractPhones(html),
+      emails: extractEmails(html),
+      telegram: extractTelegram(html),
+      success: true
+    };
+  } catch (error) {
+    return {
+      url,
+      company: 'Error loading',
+      address: null,
+      phones: [],
+      emails: [],
+      telegram: [],
+      success: false
+    };
+  }
+}
+
+module.exports = {
+  extractCompanyName,
+  extractAddress,
+  extractPhones,
+  extractEmails,
+  extractTelegram,
+  createExcelFile,
+  scrapeWebsiteFull
+};
