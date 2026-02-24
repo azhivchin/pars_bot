@@ -1,38 +1,45 @@
-# Lead Scraper Bot (@LanaAIParser_bot)
+# Lead Scraper Bot
 
-Telegram бот для автоматического сбора контактов компаний с веб-сайтов.
+Telegram bot for automated lead generation. Searches for companies by keyword using Yandex Search API, then scrapes their websites for contact information: emails, phone numbers, and Telegram accounts. Results are exported to Excel.
 
-## Возможности
+## Features
 
-- 🔍 Поиск компаний через Yandex Search API
-- 📧 Сбор email адресов
-- 📞 Извлечение телефонов
-- ✈️ Поиск Telegram аккаунтов
-- 💰 Система оплаты через YooKassa
-- 📊 Экспорт результатов в Excel
+- Company search via Yandex Search API
+- Email, phone, and Telegram contact extraction from websites
+- 30-second timeout per site with automatic skip on failure
+- Success/failure stats per scraping session
+- Excel export of collected leads
+- Subscription-based access with payment processing
+- Admin notifications on errors
+- Persistent bottom menu in Telegram
 
-## Технологии
+## Tech stack
 
-- Node.js 18+
-- Telegraf (Telegram Bot Framework)
-- PostgreSQL (база данных)
-- Yandex Search API
-- YooKassa (платежи)
+- **Node.js 18+** with Telegraf
+- **PostgreSQL** for data storage
+- **Yandex Search API** for company discovery
+- **YooKassa** for payments
 
-## Установка
+## Project structure
 
-1. Клонировать репозиторий:
-```bash
-git clone https://github.com/n0v1chek/pars_bot.git
-cd pars_bot
+```
+├── bot.js                  # Bot entry point
+├── enhanced-parser-v2.js   # Website scraper
+├── search-engines-v2.js    # Search engine integration
+└── yandex-search.js        # Yandex Search API client
 ```
 
-2. Установить зависимости:
+## Setup
+
 ```bash
 npm install
+cp .env.example .env
+# Fill in your credentials (see below)
+npm start
 ```
 
-3. Создать файл `.env`:
+## Environment variables
+
 ```env
 BOT_TOKEN=your_telegram_bot_token
 YOOKASSA_SHOP_ID=your_shop_id
@@ -53,34 +60,6 @@ YANDEX_API_KEY=your_yandex_api_key
 YANDEX_FOLDER_ID=your_yandex_folder_id
 ```
 
-4. Запустить:
-```bash
-npm start
-# или с PM2
-pm2 start bot.js --name lead-scraper-bot
-```
-
-## Структура проекта
-
-- `bot.js` - основной файл бота
-- `enhanced-parser-v2.js` - парсер веб-сайтов
-- `search-engines-v2.js` - интеграция с поисковыми системами
-- `yandex-search.js` - Yandex Search API
-
-## Функционал
-
-### Защита от зависаний
-- Таймаут 30 секунд на каждый сайт
-- Автоматический пропуск проблемных сайтов
-
-### Подсчёт ошибок
-- Статистика успешных/неудачных запросов
-- Уведомления админу при множественных ошибках
-
-### Постоянное меню
-- Всегда доступно внизу экрана
-- Защита от двойных запросов
-
-## Лицензия
+## License
 
 MIT
